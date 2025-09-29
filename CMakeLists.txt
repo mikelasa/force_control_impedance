@@ -23,3 +23,9 @@ install(DIRECTORY include/
 install(TARGETS FORCE_CONTROLLERS
   DESTINATION ${CMAKE_INSTALL_PREFIX}/lib/
 )
+
+target_include_directories(FORCE_CONTROLLERS
+        PRIVATE
+            ${CMAKE_SOURCE_DIR}/../cpplibrary/include
+            ${CMAKE_SOURCE_DIR}/../yaml-cpp/include
+        )
