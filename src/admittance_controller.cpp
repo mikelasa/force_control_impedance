@@ -32,7 +32,7 @@ SOFTWARE.
 
 #include <RobotUtilities/spatial_utilities.h>
 #include <RobotUtilities/timer_linux.h>
-#include <force_control/admittance_controller.h>
+#include "../include/force_control_impedance/admittance_controller.h"
 
 #include <Eigen/QR>
 #include <cmath>
@@ -44,7 +44,7 @@ using RUT::Matrix6d;
 using RUT::MatrixXd;
 using RUT::Vector6d;
 
-Eigen::IOFormat MatlabFmt(Eigen::StreamPrecision, 0, ", ", ";\n", "", "", "[",
+static const Eigen::IOFormat MatlabFmt(Eigen::StreamPrecision, 0, ", ", ";\n", "", "", "[",
                           "]");
 
 struct AdmittanceController::Implementation {

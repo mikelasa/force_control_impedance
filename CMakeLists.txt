@@ -1,5 +1,5 @@
 cmake_minimum_required(VERSION 2.8.3)
-project(force_control)
+project(force_control_impedance)
 
 add_definitions(-std=c++17)
 
@@ -13,7 +13,7 @@ include_directories(
 find_library(YAMLLib yaml-cpp HINTS /usr/local/lib)
 find_library(RUT Utilities HINTS ${CMAKE_INSTALL_PREFIX}/lib/RobotUtilities)
 
-add_library(FORCE_CONTROLLERS SHARED src/admittance_controller.cpp src/config_deserialize.cpp)
+add_library(FORCE_CONTROLLERS SHARED src/admittance_controller.cpp src/config_deserialize.cpp src/impedance_controller.cpp src/config_deserialize_impedance.cpp)
   target_link_libraries(FORCE_CONTROLLERS ${RUT} ${YAMLLib})
 
 install(DIRECTORY include/

@@ -1,9 +1,9 @@
-#include "force_control/config_deserialize.h"
+#include "force_control_impedance/config_deserialize.h"
 #include <RobotUtilities/spatial_utilities.h>
 
 #include <yaml-cpp/yaml.h>
 
-#include "force_control/admittance_controller.h"
+#include "force_control_impedance/admittance_controller.h"
 
 template <>
 bool deserialize(const YAML::Node& node,

@@ -22,7 +22,7 @@ Reference: Y. Hou and M. T. Mason, "Robust Execution of Contact-Rich Motion Plan
 class ImpedanceController {
  public:
   struct ImpedanceControllerConfig {
-    double dt{0.002};  // used for integration/differentiation
+    double dt{0.001};  // used for integration/differentiation
     bool log_to_file{false};
     std::string log_file_path{""};
     bool alert_overrun{
@@ -32,7 +32,7 @@ class ImpedanceController {
       // Admittance parameters
       RUT::Matrix6d stiffness{};
       RUT::Matrix6d damping{};
-      RUT::Matrix6d inertia{};
+      //RUT::Matrix6d inertia{}; // not needed for sensorless, 
       RUT::Vector6d stiction{};  // static friction, eliminates drifting
     };
     ComplianceParameters6d compliance6d{};
@@ -40,17 +40,6 @@ class ImpedanceController {
     double max_spring_force_magnitude{0.0};
     double max_spring_torque_magnitude{0.0};
 
-    struct PIDGains {
-      double P_trans{0.0};
-      double I_trans{0.0};
-      double D_trans{0.0};
-
-      double P_rot{0.0};
-      double I_rot{0.0};
-      double D_rot{0.0};
-    };
-    PIDGains direct_force_control_gains{};
-    RUT::Vector6d direct_force_control_I_limit{};
   };
 
   ImpedanceController();
@@ -132,9 +121,19 @@ class ImpedanceController {
    */
   void displayStates();
 
+  /**
+   * @brief      Get robot Jacobian
+   */
+  void getJacobian(const Eigen::Matrix<double, 6, 7>& jacob);
+
+  /**
+   * @brief      Get robot velocity
+   */
+  void getVelocity(const Eigen::Matrix<double, 7, 1>&  joint_vel);
+
  private:
   struct Implementation;
   std::unique_ptr<Implementation> m_impl;
 };
 
-#endif  // _ADMITTANCE_CONTROLLER_H_
+#endif  // _IMPEDANCE_CONROLLER_H_

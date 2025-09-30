@@ -9,7 +9,7 @@ Reference: Y. Hou and M. T. Mason, "Robust Execution of Contact-Rich Motion Plan
 
 #include <RobotUtilities/spatial_utilities.h>
 #include <RobotUtilities/timer_linux.h>
-#include <force_control/admittance_controller.h>
+#include <force_control_impedance/impedance_controller.h>
 
 #include <Eigen/QR>
 #include <cmath>
@@ -20,16 +20,27 @@ using RUT::Matrix4d;
 using RUT::Matrix6d;
 using RUT::MatrixXd;
 using RUT::Vector6d;
+using RUT::Vector3d;
+using RUT::Quaterniond;
+using RUT::VectorXd;
+using RUT::MatrixXd;
 
-Eigen::IOFormat MatlabFmt(Eigen::StreamPrecision, 0, ", ", ";\n", "", "", "[",
+// Helper function to log Eigen vectors of length 7
+void stream_vector7(std::ostream& os, const Eigen::Matrix<double, 7, 1>& vec) {
+    for (int i = 0; i < 7; ++i) {
+        os << vec(i) << "\t";
+    }
+}
+
+static const Eigen::IOFormat MatlabFmt(Eigen::StreamPrecision, 0, ", ", ";\n", "", "", "[",
                           "]");
 
-struct AdmittanceController::Implementation {
+struct ImpedanceController::Implementation {
   Implementation();
   ~Implementation();
   bool initialize(
       const RUT::TimePoint& time_initial_0,
-      const AdmittanceControllerConfig& admittance_controller_config);
+      const ImpedanceControllerConfig& impedance_controller_config);
 
   void setRobotStatus(const RUT::Vector7d& pose_WT,
                       const RUT::Vector6d& wrench_WT);
@@ -42,70 +53,58 @@ struct AdmittanceController::Implementation {
   void reset();
   void logStates();
   void displayStates();
+  void getJacobian(const Eigen::Matrix<double, 6, 7>& jacob);
+  void getVelocity(const Eigen::Matrix<double, 7, 1>&  joint_vel);
 
-  AdmittanceControllerConfig config{};
+  ImpedanceControllerConfig config{};
 
   // internal controller states
-  Matrix6d Tr{};
-  Matrix6d Tr_inv{};
-  Vector6d v_force_selection{};
-  Vector6d v_velocity_selection{};
-  Matrix6d diag_force_selection{};
-  Matrix6d diag_velocity_selection{};
-  Matrix6d m_anni{};
+  // poses and positions
+  VectorXd pose_fb{7};
+  Vector3d pose_fb_trans{3};
+  VectorXd pose_ref{7};
+  Vector3d pose_ref_trans{3};
+  VectorXd pose_error{6};
+  VectorXd dq{7};
 
-  Matrix4d SE3_WTref{};
-  Matrix4d SE3_WT{};
-  Matrix4d SE3_TrefTadj{};
-  Matrix4d SE3_WTadj{};
-  Matrix4d SE3_TTadj{};
-  Matrix4d SE3_WT_cmd{};
-  Vector6d spt_TTadj{};
-  Vector6d spt_TTadj_new{};
-  Matrix6d Adj_WT{};
-  Matrix6d Adj_TW{};
-  Matrix6d Jac_v_spt{};
-  Matrix6d Jac_v_spt_inv{};
+  // rotations
+  Quaterniond error_quaternion{};
+  Quaterniond pose_fb_rot{};
+  Quaterniond pose_ref_rot{};
 
-  Vector6d v_spatial_WT{};
-  Vector6d v_body_WT{};
-  Vector6d v_body_WT_ref{};
-  Vector6d v_Tr{};
-  Vector6d vd_Tr{};
-  Vector6d wrench_T_Err_prev{};
-  Vector6d wrench_T_Err_I{};
+  //jacobian
+  MatrixXd jacobian;
+  MatrixXd jacobian_pseud_inv;
 
-  Vector6d wrench_T_fb{};  // force feedback measured in tool frame
-  Vector6d wrench_Tr_cmd{};
-  Vector6d wrench_T_spring{};
-  Vector6d wrench_Tr_spring{};
-  Vector6d wrench_Tr_fb{};
-  Vector6d wrench_T_cmd{};
-  Vector6d wrench_T_Err{};
-  Vector6d wrench_T_PID{};
-  Vector6d wrench_Tr_PID{};
-  Vector6d wrench_Tr_Err{};
-  Vector6d wrench_Tr_damping{};
-  Vector6d wrench_Tr_All{};
+  //forces
+  Vector6d wrench_T_fb{};
+  Vector6d wrench_ref{};
+
+  // torques
+  VectorXd tau_task{7};
+  VectorXd tau_nullspace{7};
+  VectorXd tau_ext{7};
+  VectorXd tau_d{7};
 
   // misc
+  Matrix6d Tr{};
   RUT::Timer timer{};
   RUT::Profiler profiler{};
   std::ofstream log_file{};
 };
 
-AdmittanceController::Implementation::Implementation() {}
+ImpedanceController::Implementation::Implementation() {}
 
-AdmittanceController::Implementation::~Implementation() {
+ImpedanceController::Implementation::~Implementation() {
   if (config.log_to_file)
     log_file.close();
 }
 
-bool AdmittanceController::Implementation::initialize(
+bool ImpedanceController::Implementation::initialize(
     const RUT::TimePoint& time_initial_0,
-    const AdmittanceControllerConfig& admittance_controller_config) {
-  std::cout << "[AdmittanceController] Begin initialization.\n";
-  config = admittance_controller_config;
+    const ImpedanceControllerConfig& impedance_controller_config) {
+  std::cout << "[ImpedanceController] Begin initialization.\n";
+  config = impedance_controller_config;
   timer.tic(time_initial_0);
 
   reset();
@@ -113,54 +112,47 @@ bool AdmittanceController::Implementation::initialize(
   if (config.log_to_file) {
     log_file.open(config.log_file_path);
     if (log_file.is_open())
-      std::cout << "[AdmittanceController] log file opened successfully at "
+      std::cout << "[ImpedanceController] log file opened successfully at "
                 << config.log_file_path << std::endl;
     else
-      std::cerr << "[AdmittanceController] Failed to open log file at "
+      std::cerr << "[ImpedanceController] Failed to open log file at "
                 << config.log_file_path << std::endl;
   }
   return true;
 }
 
-void AdmittanceController::Implementation::setRobotStatus(
+void ImpedanceController::Implementation::setRobotStatus(
     const RUT::Vector7d& pose_WT, const RUT::Vector6d& wrench_WT) {
-  SE3_WT = RUT::pose2SE3(pose_WT);
+  
+  //gets feedback
+  pose_fb = pose_WT;
   wrench_T_fb = -wrench_WT;
+
+  // split pose into position and quaternions
+  pose_fb_trans = pose_fb.head(3);
+  //todo: CONVENCIONES!
+  pose_fb_rot.coeffs() = pose_fb.tail(4);
+
 }
 
-void AdmittanceController::Implementation::setRobotReference(
+void ImpedanceController::Implementation::setRobotReference(
     const RUT::Vector7d& pose_WT, const RUT::Vector6d& wrench_WTr) {
-  SE3_WTref = RUT::pose2SE3(pose_WT);
-  wrench_Tr_cmd = wrench_WTr;
+  //gets ref command
+  pose_ref = pose_WT;
+  wrench_ref = wrench_WTr;
+
+  // split pose into position and quaternions
+  pose_ref_trans = pose_ref.head(3);
+  pose_ref_rot.coeffs() = pose_ref.tail(4);
 }
 
 // After axis update, the goal pose with offset should be equal to current pose
 // in the new velocity controlled axes. To satisfy this requirement, we need to
 // change SE3_TrefTadj accordingly
-void AdmittanceController::Implementation::setForceControlledAxis(
+void ImpedanceController::Implementation::setForceControlledAxis(
     const Matrix6d& Tr_new, int n_af) {
-  v_force_selection = Vector6d::Zero();
-  v_velocity_selection = Vector6d::Ones();
-  for (int i = 0; i < n_af; ++i) {
-    v_force_selection(i) = 1;
-    v_velocity_selection(i) = 0;
-  }
-  diag_force_selection = v_force_selection.asDiagonal();
-  diag_velocity_selection = v_velocity_selection.asDiagonal();
 
-  m_anni = diag_velocity_selection * Tr * Jac_v_spt;
-  spt_TTadj_new =
-      (Matrix6d::Identity() - RUT::pseudoInverse(m_anni, 1e-6) * m_anni) *
-      spt_TTadj;
-  SE3_TrefTadj = SE3_WT * RUT::spt2SE3(spt_TTadj_new) * RUT::SE3Inv(SE3_WTref);
-
-  // project these into force space
-  wrench_T_Err_I = Tr_inv * diag_force_selection * Tr * wrench_T_Err_I;
-  wrench_T_Err_prev = Tr_inv * diag_force_selection * Tr * wrench_T_Err_prev;
-
-  Tr = Tr_new;
-  Tr_inv = Tr.inverse();
-
+  /*
   if (std::isnan(SE3_TrefTadj(0, 0))) {
     std::cerr << "\nThe computed offset has NaN." << std::endl;
     std::cerr << "SE3_WT:\n" << SE3_WT.format(MatlabFmt) << std::endl;
@@ -177,164 +169,70 @@ void AdmittanceController::Implementation::setForceControlledAxis(
     std::cerr << "\nNow paused at setForceControlledAxis()";
     getchar();
   }
+    */
 }
 
-void AdmittanceController::Implementation::setStiffnessMatrix(
+void ImpedanceController::Implementation::setStiffnessMatrix(
     const Matrix6d& stiffness) {
   config.compliance6d.stiffness = stiffness;
 }
 
-void AdmittanceController::Implementation::setDampingMatrix(
+void ImpedanceController::Implementation::setDampingMatrix(
     const Matrix6d& damping) {
   config.compliance6d.damping = damping;
 }
 
-// clang-format off
 /*
- *
-    force control law
-        Frames:
-            W: world frame
-            T: current tool frame
-            Tr: transformed genepose_currentralized space
-        Frame suffixes
-            fb: feedback (default, often omitted)
-            ref: user provided reference, target
-            adj: offset adjusted (command tool frame)
-            cmd: output command, to be sent to the robot
-        Quantities:
-            SE3: 4x4 homogeneous coordinates
-            se3: 6x1 twist coordinate of SE3
-            spt: 6x1 special twist: 3x1 position, 3x1 exponential coordinate for rotation
-            v: 6x1 velocity measured in an inertia frame.
-              v_body: body velocity.
-              v_spatial: spatial velocity.
-            wrench: 6x1 wrench. Makes work with body velocity
-            Jac_v_spt: 6x6 jacobian from body velocity to spt:
-                Jac_v_spt * body velocity = spt time derivative
-            Tr: 6x6 transformation matrix. Describes the force-velocity decomposition
- *
- */
-// clang-format on
-int AdmittanceController::Implementation::step(RUT::Vector7d& pose_to_send) {
+Control step based on the sensorless cartesian impedance control:
+
+  total torque is compute based on:
+    - task torque
+    - nullspace torque
+    - external torque
+
+*/
+int ImpedanceController::Implementation::step(RUT::Vector7d& torque_to_send) {
   profiler.clear();
   profiler.start();
   timer.tic();
   // ----------------------------------------
-  //  Compute Forces in Generalized space
+  //  /* Position updates */
   // ----------------------------------------
-  /* Position updates */
-  SE3_WTadj = SE3_WTref * SE3_TrefTadj;
-  SE3_TTadj = RUT::SE3Inv(SE3_WT) * SE3_WTadj;  // aka SE3_S_err
-  spt_TTadj = RUT::SE32spt(SE3_TTadj);
-
-  Jac_v_spt_inv = RUT::JacobianSpt2BodyV(SE3_WT.block<3, 3>(0, 0));
-  Jac_v_spt = Jac_v_spt_inv.inverse();
-
-  Adj_WT = RUT::SE32Adj(SE3_WT);
-  Adj_TW = RUT::SE32Adj(RUT::SE3Inv(SE3_WT));
-
-  /* Velocity updates */
-  v_body_WT = Adj_TW * v_spatial_WT;
-  v_Tr = Tr * v_body_WT;
-
-  /* Wrench updates */
-  wrench_T_spring = Jac_v_spt * config.compliance6d.stiffness * spt_TTadj;
+  
+  // compute pose translation error
+  pose_error.head(3) << pose_fb_trans - pose_ref_trans;
+  
+  //orientation error
+  if (pose_ref_rot.coeffs().dot(pose_fb_rot.coeffs()) < 0.0) 
+  {
+    pose_fb_rot.coeffs() << -pose_fb_rot.coeffs();
+  }
+  
+  //difference quaternion
+  error_quaternion = pose_fb_rot.inverse() * pose_ref_rot;
+  pose_error.tail(3) << error_quaternion.x(), error_quaternion.y(), error_quaternion.z();
+  //transform to angle axis
+  Eigen::AngleAxisd angle_axis(error_quaternion);
+  pose_error.tail(3) << angle_axis.axis() * angle_axis.angle();
+   
   profiler.stop("1");
   profiler.start();
 
-  // clip spring force
-  if (config.max_spring_force_magnitude > 0) {
-    double spring_force_magnitude = wrench_T_spring.head<3>().norm();
-    if (spring_force_magnitude > config.max_spring_force_magnitude) {
-      wrench_T_spring.head<3>() *=
-          config.max_spring_force_magnitude / spring_force_magnitude;
-    }
-  }
-  if (config.max_spring_torque_magnitude > 0) {
-    double spring_torque_magnitude = wrench_T_spring.tail<3>().norm();
-    if (spring_torque_magnitude > config.max_spring_torque_magnitude) {
-      wrench_T_spring.tail<3>() *=
-          config.max_spring_torque_magnitude / spring_torque_magnitude;
-    }
-  }
+  // ----------------------------------------
+  //  compute torques
+  // ----------------------------------------
 
-  wrench_Tr_spring = Tr * wrench_T_spring;
+  // compute task torques (impedance model)
+  // debug each element of the equation
+  tau_task << jacobian.transpose() * (-config.compliance6d.stiffness * pose_error - config.compliance6d.damping * (jacobian * dq));
+  tau_d << tau_task;
 
-  /* Force error, PID force control */
-  wrench_T_cmd = Tr_inv * wrench_Tr_cmd;
-  wrench_T_Err = wrench_T_cmd - wrench_T_fb;
-  wrench_T_Err_I += wrench_T_Err;
-  RUT::truncate6d(&wrench_T_Err_I, -config.direct_force_control_I_limit,
-                  config.direct_force_control_I_limit);
-
-  wrench_T_PID.head(3) =
-      config.direct_force_control_gains.P_trans * wrench_T_Err.head(3) +
-      config.direct_force_control_gains.I_trans * wrench_T_Err_I.head(3) +
-      config.direct_force_control_gains.D_trans *
-          (wrench_T_Err.head(3) - wrench_T_Err_prev.head(3));
-  wrench_T_PID.tail(3) =
-      config.direct_force_control_gains.P_rot * wrench_T_Err.tail(3) +
-      config.direct_force_control_gains.I_rot * wrench_T_Err_I.tail(3) +
-      config.direct_force_control_gains.D_rot *
-          (wrench_T_Err.tail(3) - wrench_T_Err_prev.tail(3));
-  wrench_Tr_PID = Tr * wrench_T_PID;
-  wrench_T_Err_prev = wrench_T_Err;
-  wrench_Tr_Err = Tr * wrench_T_Err;
-
-  /* Apply static friction */
-  for (int i = 0; i < 6; ++i) {
-    if (std::abs(wrench_Tr_Err(i)) < config.compliance6d.stiction(i)) {
-      wrench_Tr_Err(i) = 0;
-    }
-  }
-
-  wrench_Tr_damping = -Tr * config.compliance6d.damping * v_body_WT;
-
-  wrench_Tr_All = diag_force_selection * (wrench_Tr_spring + wrench_Tr_Err +
-                                          wrench_Tr_PID + wrench_Tr_damping);
   profiler.stop("2");
   profiler.start();
-  // ----------------------------------------
-  //  force to velocity
-  // ----------------------------------------
 
-  /* Newton's Law */
-  //  Axes are no longer independent when we take
-  //      rotation in to consideration.
-  //  Newton's Law in body (Tool) frame:
-  //      W=M*vd
-  //          W: body wrench
-  //          M: Inertia matrix in body frame
-  //          vd: body velocity time derivative
-  //  Newton's law in transformed space
-  //      TW=TMTinv Tvd
-  //      W_Tr = TMTinv vd_Tr
-  vd_Tr = (Tr * config.compliance6d.inertia * Tr_inv)
-              .fullPivLu()
-              .solve(wrench_Tr_All);
+  torque_to_send = tau_d;
 
-  // Velocity in the force-controlled direction: integrate acc computed from
-  // Newton's law
-  v_Tr += config.dt * vd_Tr;
-  v_Tr = diag_force_selection *
-         v_Tr;  // clean up velocity in the velocity-controlled direction
-
-  // Velocity in the velocity-controlled direction: derive from reference pose
-  v_body_WT_ref = Jac_v_spt_inv * spt_TTadj /
-                  config.dt;  // reference velocity, derived from reference pose
-  v_Tr += diag_velocity_selection * Tr * v_body_WT_ref;
-
-  v_spatial_WT = Adj_WT * Tr_inv * v_Tr;
-  profiler.stop("3");
-  profiler.start();
-  // ----------------------------------------
-  //  velocity to pose
-  // ----------------------------------------
-  SE3_WT_cmd = SE3_WT + RUT::wedge6(v_spatial_WT) * SE3_WT * config.dt;
-  RUT::SE32Pose(SE3_WT_cmd, pose_to_send);
-
-  if (std::isnan(pose_to_send[0])) {
+  if (std::isnan(torque_to_send[0])) {
     std::cerr << "==================== pose is nan. =====================\n";
     displayStates();
     std::cerr << "Press ENTER to continue..." << std::endl;
@@ -349,7 +247,7 @@ int AdmittanceController::Implementation::step(RUT::Vector7d& pose_to_send) {
   profiler.stop("5");
   double timenow = timer.toc_ms();
   if (config.alert_overrun && timenow > config.dt * 1000.) {
-    std::cerr << "AdmittanceController: step took too long: " << timenow << "ms"
+    std::cerr << "impedanceController: step took too long: " << timenow << "ms"
               << std::endl;
     std::cerr << "Profiler: " << std::endl;
     profiler.show();
@@ -358,93 +256,43 @@ int AdmittanceController::Implementation::step(RUT::Vector7d& pose_to_send) {
   return true;
 }
 
-void AdmittanceController::Implementation::reset() {
+void ImpedanceController::Implementation::reset() {
   Tr = Matrix6d::Identity();
-  Tr_inv = Matrix6d::Identity();
-  v_force_selection = Vector6d::Zero();
-  v_velocity_selection = Vector6d::Ones();
-  diag_force_selection = Matrix6d::Zero();
-  diag_velocity_selection = Matrix6d::Identity();
-  m_anni = Matrix6d::Identity();
-
-  SE3_WTref = Matrix4d::Identity();
-  SE3_WT = Matrix4d::Identity();
-  SE3_TrefTadj = Matrix4d::Identity();
-  SE3_WTadj = Matrix4d::Identity();
-  SE3_TTadj = Matrix4d::Identity();
-  SE3_WT_cmd = Matrix4d::Identity();
-  spt_TTadj = Vector6d::Zero();
-  spt_TTadj_new = Vector6d::Zero();
-  Adj_WT = Matrix6d::Identity();
-  Adj_TW = Matrix6d::Identity();
-  Jac_v_spt = Matrix6d::Identity();
-  Jac_v_spt_inv = Matrix6d::Identity();
-
-  v_spatial_WT = Vector6d::Zero();
-  v_body_WT = Vector6d::Zero();
-  v_body_WT_ref = Vector6d::Zero();
-  v_Tr = Vector6d::Zero();
-  vd_Tr = Vector6d::Zero();
-  wrench_T_Err_prev = Vector6d::Zero();
-  wrench_T_Err_I = Vector6d::Zero();
-
   wrench_T_fb = Vector6d::Zero();
-  wrench_Tr_cmd = Vector6d::Zero();
-  wrench_T_spring = Vector6d::Zero();
-  wrench_Tr_spring = Vector6d::Zero();
-  wrench_Tr_fb = Vector6d::Zero();
-  wrench_T_cmd = Vector6d::Zero();
-  wrench_T_Err = Vector6d::Zero();
-  wrench_T_PID = Vector6d::Zero();
-  wrench_Tr_PID = Vector6d::Zero();
-  wrench_Tr_Err = Vector6d::Zero();
-  wrench_Tr_damping = Vector6d::Zero();
-  wrench_Tr_All = Vector6d::Zero();
+  pose_fb = RUT::Vector7d::Zero();
+  pose_fb_trans = Vector3d::Zero();
+  pose_fb_rot = Quaterniond::Identity();
+  pose_ref = RUT::Vector7d::Zero();
+  pose_ref_trans = Vector3d::Zero();
+  pose_ref_rot = Quaterniond::Identity();
+  pose_error = RUT::Vector6d::Zero();
+  dq = RUT::Vector7d::Zero();
+  jacobian = MatrixXd::Zero(6, 7);
+  jacobian_pseud_inv = MatrixXd::Zero(7, 6);
+  tau_task = RUT::Vector7d::Zero();
+  tau_nullspace = RUT::Vector7d::Zero();
+  tau_ext = RUT::Vector7d::Zero();
+  tau_d = RUT::Vector7d::Zero();
+  error_quaternion = Quaterniond::Identity();
+
+
 }
 
-void AdmittanceController::Implementation::logStates() {
+void ImpedanceController::Implementation::logStates() {
   log_file << timer.toc_ms() << " ";
-  RUT::stream_array_in(log_file, SE3_WTref.block<3, 1>(0, 3), 3);
-  RUT::stream_array_in(log_file, SE3_WT.block<3, 1>(0, 3), 3);
-  RUT::stream_array_in(log_file, SE3_WTadj.block<3, 1>(0, 3), 3);
-  RUT::stream_array_in(log_file, SE3_WT_cmd.block<3, 1>(0, 3), 3);
+  
+  stream_vector7(log_file, pose_fb);
+  stream_vector7(log_file, pose_ref);
+  RUT::stream_array_in6d(log_file, pose_error);
+  stream_vector7(log_file, dq);
   RUT::stream_array_in6d(log_file, wrench_T_fb);
-  RUT::stream_array_in6d(log_file, wrench_Tr_All);
-
-  // SE3_TrefTadj = Matrix4d::Identity();
-  // SE3_TTadj = Matrix4d::Identity();
-  // spt_TTadj = Vector6d::Zero();
-  // spt_TTadj_new = Vector6d::Zero();
-  // Adj_WT = Matrix6d::Identity();
-  // Adj_TW = Matrix6d::Identity();
-  // Jac_v_spt = Matrix6d::Identity();
-  // Jac_v_spt_inv = Matrix6d::Identity();
-
-  // v_spatial_WT = Vector6d::Zero();
-  // v_body_WT = Vector6d::Zero();
-  // v_body_WT_ref = Vector6d::Zero();
-  // v_Tr = Vector6d::Zero();
-  // vd_Tr = Vector6d::Zero();
-  // wrench_T_Err_prev = Vector6d::Zero();
-  // wrench_T_Err_I = Vector6d::Zero();
-
-  // wrench_T_fb = Vector6d::Zero();
-  // wrench_Tr_cmd = Vector6d::Zero();
-  // wrench_T_spring = Vector6d::Zero();
-  // wrench_Tr_spring = Vector6d::Zero();
-  // wrench_Tr_fb = Vector6d::Zero();
-  // wrench_T_cmd = Vector6d::Zero();
-  // wrench_T_Err = Vector6d::Zero();
-  // wrench_T_PID = Vector6d::Zero();
-  // wrench_Tr_PID = Vector6d::Zero();
-  // wrench_Tr_Err = Vector6d::Zero();
-  // wrench_Tr_damping = Vector6d::Zero();
-  // wrench_Tr_All = Vector6d::Zero();
-
+  stream_vector7(log_file, tau_task);
+  stream_vector7(log_file, tau_d);
   log_file << std::endl;
 }
 
-void AdmittanceController::Implementation::displayStates() {
+void ImpedanceController::Implementation::displayStates() {
+  
   std::cout << "================= Parameters ================== " << std::endl;
   std::cout << "dt: " << config.dt << std::endl;
   std::cout << "log_to_file: " << config.log_to_file << std::endl;
@@ -453,23 +301,7 @@ void AdmittanceController::Implementation::displayStates() {
             << config.compliance6d.stiffness.format(MatlabFmt) << std::endl;
   std::cout << "compliance6d.damping: "
             << config.compliance6d.damping.format(MatlabFmt) << std::endl;
-  std::cout << "compliance6d.inertia: "
-            << config.compliance6d.inertia.format(MatlabFmt) << std::endl;
-  std::cout << "direct_force_control_gains.P_trans: "
-            << config.direct_force_control_gains.P_trans << std::endl;
-  std::cout << "direct_force_control_gains.I_trans: "
-            << config.direct_force_control_gains.I_trans << std::endl;
-  std::cout << "direct_force_control_gains.D_trans: "
-            << config.direct_force_control_gains.D_trans << std::endl;
-  std::cout << "direct_force_control_gains.P_rot: "
-            << config.direct_force_control_gains.P_rot << std::endl;
-  std::cout << "direct_force_control_gains.I_rot: "
-            << config.direct_force_control_gains.I_rot << std::endl;
-  std::cout << "direct_force_control_gains.D_rot: "
-            << config.direct_force_control_gains.D_rot << std::endl;
-  std::cout << "direct_force_control_I_limit: "
-            << config.direct_force_control_I_limit.format(MatlabFmt)
-            << std::endl;
+  /*
   std::cout << "================= Internal states ================== "
             << std::endl;
   std::cout << "Tr: " << Tr.format(MatlabFmt) << std::endl;
@@ -526,15 +358,32 @@ void AdmittanceController::Implementation::displayStates() {
             << std::endl;
   std::cout << "wrench_Tr_All: " << wrench_Tr_All.format(MatlabFmt)
             << std::endl;
+            */
 }
 
-AdmittanceController::AdmittanceController()
-    : m_impl{std::make_unique<Implementation>()} {}
-AdmittanceController::~AdmittanceController() = default;
-AdmittanceController::AdmittanceController(AdmittanceController&&) = default;
+void ImpedanceController::Implementation::getJacobian(const Eigen::Matrix<double, 6, 7>& jacob) {
 
-bool AdmittanceController::init(const RUT::TimePoint& time0,
-                                const AdmittanceControllerConfig& config,
+  // get the jacobian
+  jacobian = jacob;
+
+  // compute the pseudoinverse of the jacobian 
+  jacobian_pseud_inv = jacob.completeOrthogonalDecomposition().solve(Eigen::MatrixXd::Identity(6, 6));
+
+}
+
+void ImpedanceController::Implementation::getVelocity(const Eigen::Matrix<double, 7, 1>&  joint_vel) {
+
+  dq = Eigen::VectorXd(joint_vel);
+
+}
+
+ImpedanceController::ImpedanceController()
+    : m_impl{std::make_unique<Implementation>()} {}
+ImpedanceController::~ImpedanceController() = default;
+ImpedanceController::ImpedanceController(ImpedanceController&&) = default;
+
+bool ImpedanceController::init(const RUT::TimePoint& time0,
+                                const ImpedanceControllerConfig& config,
                                 const RUT::Vector7d& pose_current) {
   m_impl->initialize(time0, config);
 
@@ -545,37 +394,45 @@ bool AdmittanceController::init(const RUT::TimePoint& time0,
   step(pose_out);
   setForceControlledAxis(Matrix6d::Identity(), 0);
 
-  std::cout << "[AdmittanceController] initialization is done." << std::endl;
+  std::cout << "[impedanceController] initialization is done." << std::endl;
   return true;
 }
 
-void AdmittanceController::setRobotStatus(const RUT::Vector7d& pose_WT,
+void ImpedanceController::setRobotStatus(const RUT::Vector7d& pose_WT,
                                           const RUT::Vector6d& wrench_WT) {
   m_impl->setRobotStatus(pose_WT, wrench_WT);
 }
 
-void AdmittanceController::setRobotReference(const RUT::Vector7d& pose_WT,
+void ImpedanceController::setRobotReference(const RUT::Vector7d& pose_WT,
                                              const RUT::Vector6d& wrench_WTr) {
   m_impl->setRobotReference(pose_WT, wrench_WTr);
 }
 
-void AdmittanceController::setForceControlledAxis(const Matrix6d& Tr_new,
+void ImpedanceController::setForceControlledAxis(const Matrix6d& Tr_new,
                                                   int n_af) {
   m_impl->setForceControlledAxis(Tr_new, n_af);
 }
 
-void AdmittanceController::setStiffnessMatrix(const Matrix6d& stiffness) {
+void ImpedanceController::setStiffnessMatrix(const Matrix6d& stiffness) {
   m_impl->setStiffnessMatrix(stiffness);
 }
 
-void AdmittanceController::setDampingMatrix(const Matrix6d& damping) {
+void ImpedanceController::setDampingMatrix(const Matrix6d& damping) {
   m_impl->setDampingMatrix(damping);
 }
 
-int AdmittanceController::step(RUT::Vector7d& pose_to_send) {
+int ImpedanceController::step(RUT::Vector7d& pose_to_send) {
   return m_impl->step(pose_to_send);
 }
 
-void AdmittanceController::displayStates() {
+void ImpedanceController::displayStates() {
   m_impl->displayStates();
+}
+
+void ImpedanceController::getJacobian(const Eigen::Matrix<double, 6, 7>& jacob) {
+    m_impl->getJacobian(jacob);
+}
+
+void ImpedanceController::getVelocity(const Eigen::Matrix<double, 7, 1>&  joint_vel) {
+    m_impl->getVelocity(joint_vel);
 }
