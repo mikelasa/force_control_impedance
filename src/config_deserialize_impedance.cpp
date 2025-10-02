@@ -19,6 +19,10 @@ bool deserialize(const YAML::Node& node,
     config.compliance6d.damping =
         RUT::deserialize_vector<RUT::Vector6d>(node["compliance6d"]["damping"])
             .asDiagonal();
+    config.compliance6d.nullspace_stiffness = RUT::deserialize_vector<RUT::VectorXd>(
+        node["compliance6d"]["nullspace_stiffness"]).asDiagonal();
+    config.compliance6d.nullspace_damping = RUT::deserialize_vector<RUT::VectorXd>(
+        node["compliance6d"]["nullspace_damping"]).asDiagonal();
     config.compliance6d.stiction = RUT::deserialize_vector<RUT::Vector6d>(
         node["compliance6d"]["stiction"]);
 
@@ -42,6 +46,18 @@ bool deserialize(const YAML::Node& node,
   if ((config.compliance6d.damping.diagonal().array() < 0).any()) {
     std::cerr << "Invalid compliance6d.damping: "
               << config.compliance6d.damping.diagonal().transpose()
+              << ". All diagonal elements should be positive." << std::endl;
+    return false;
+  }
+  if ((config.compliance6d.nullspace_stiffness.diagonal().array() < 0).any()) {
+    std::cerr << "Invalid compliance6d.nullspace_stiffness: "
+              << config.compliance6d.nullspace_stiffness.diagonal().transpose()
+              << ". All diagonal elements should be positive." << std::endl;
+    return false;
+  }
+  if ((config.compliance6d.nullspace_damping.diagonal().array() < 0).any()) {
+    std::cerr << "Invalid compliance6d.nullspace_damping: "
+              << config.compliance6d.nullspace_damping.diagonal().transpose()
               << ". All diagonal elements should be positive." << std::endl;
     return false;
   }

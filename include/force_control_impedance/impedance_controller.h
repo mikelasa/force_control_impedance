@@ -13,6 +13,7 @@ Reference: Y. Hou and M. T. Mason, "Robust Execution of Contact-Rich Motion Plan
 
 #include <RobotUtilities/spatial_utilities.h>
 #include <RobotUtilities/timer_linux.h>
+#include <franka/robot_state.h>
 
 #include <Eigen/Geometry>
 #include <chrono>
@@ -25,21 +26,17 @@ class ImpedanceController {
     double dt{0.001};  // used for integration/differentiation
     bool log_to_file{false};
     std::string log_file_path{""};
-    bool alert_overrun{
-        false};  // if true, print warning when step() takes too long
+    bool alert_overrun{false};  // if true, print warning when step() takes too long
 
     struct ComplianceParameters6d {
       // Admittance parameters
       RUT::Matrix6d stiffness{};
       RUT::Matrix6d damping{};
-      //RUT::Matrix6d inertia{}; // not needed for sensorless, 
+      RUT::MatrixXd nullspace_stiffness{7, 7};
+      RUT::MatrixXd nullspace_damping{7, 7};
       RUT::Vector6d stiction{};  // static friction, eliminates drifting
     };
     ComplianceParameters6d compliance6d{};
-    // spring force will be capped at this value.
-    double max_spring_force_magnitude{0.0};
-    double max_spring_torque_magnitude{0.0};
-
   };
 
   ImpedanceController();
@@ -102,6 +99,20 @@ class ImpedanceController {
   void setDampingMatrix(const RUT::Matrix6d& damping);
 
   /**
+   * @brief      Sets the stiffness matrix.
+   *
+   * @param[in]  stiffness  The stiffness matrix.
+   */
+  void setNullspaceStiffnessMatrix(const RUT::MatrixXd& stiffness);
+
+  /**
+   * @brief      Sets the damping matrix.
+   *
+   * @param[in]  damping  The damping matrix.
+   */
+  void setNullspaceDampingMatrix(const RUT::MatrixXd& damping);
+
+  /**
    * @brief return true if no error.
    */
   int step(RUT::Vector7d& pose);
@@ -127,9 +138,9 @@ class ImpedanceController {
   void getJacobian(const Eigen::Matrix<double, 6, 7>& jacob);
 
   /**
-   * @brief      Get robot velocity
+   * @brief      Get robot state (franka::RobotState)
    */
-  void getVelocity(const Eigen::Matrix<double, 7, 1>&  joint_vel);
+  void getRobotState(franka::RobotState& state);
 
  private:
   struct Implementation;
