@@ -1,15 +1,16 @@
-/*
-This file is part of the package
-https://github.com/mikelasa/force_control_impedance
-
-Reference: Y. Hou and M. T. Mason, "Robust Execution of Contact-Rich Motion Plans by Hybrid Force-Velocity Control,"
-           2019 International Conference on Robotics and Automation (ICRA), Montreal, QC, Canada, 2019, pp. 1933-1939
-
-*/
+/**
+ * IMPEDANCE CONTROLLER
+ * 
+ * This file is part of the package:
+ * https://github.com/mikelasa/force_control_impedance
+ *
+ * Reference: Matthias Mayr, Julian M. Salt-Ducaju, "A C++ Implementation of a Cartesian Impedance Controller for Robotic Manipulators"
+ *
+ */
 
 #pragma once
-#ifndef _IMPEDANCE_CONROLLER_H_
-#define _IMPEDANCE_CONROLLER_H_
+#ifndef _IMPEDANCE_CONTROLLER_H_
+#define _IMPEDANCE_CONTROLLER_H_
 
 #include <RobotUtilities/spatial_utilities.h>
 #include <RobotUtilities/timer_linux.h>
@@ -22,129 +23,162 @@ Reference: Y. Hou and M. T. Mason, "Robust Execution of Contact-Rich Motion Plan
 
 class ImpedanceController {
  public:
+  /**
+   * Configuration structure for ImpedanceController initialization
+   * Contains all necessary parameters for controller setup and operation
+   */
   struct ImpedanceControllerConfig {
-    double dt{0.001};  // used for integration/differentiation
-    bool log_to_file{false};
-    std::string log_file_path{""};
-    bool alert_overrun{false};  // if true, print warning when step() takes too long
+    double dt{0.001};                                        // Integration/differentiation time step (s)
+    bool log_to_file{false};                                 // Enable data logging to file
+    std::string log_file_path{""};                           // Path for log file output
+    bool alert_overrun{false};                               // Print warning when step() exceeds time limit
 
+    /**
+     * 6DOF compliance parameters for force/position control
+     * Defines the mechanical impedance characteristics of the controller
+     */
     struct ComplianceParameters6d {
-      // Admittance parameters
-      RUT::Matrix6d stiffness{};
-      RUT::Matrix6d damping{};
-      RUT::MatrixXd nullspace_stiffness{7, 7};
-      RUT::MatrixXd nullspace_damping{7, 7};
-      RUT::Vector6d stiction{};  // static friction, eliminates drifting
+      RUT::Matrix6d stiffness{};                             // Cartesian stiffness matrix [N/m, Nm/rad]
+      RUT::Matrix6d damping{};                               // Cartesian damping matrix [Ns/m, Nms/rad]
+      RUT::MatrixXd nullspace_stiffness{7, 7};               // Joint nullspace stiffness matrix [Nm/rad]
+      RUT::MatrixXd nullspace_damping{7, 7};                 // Joint nullspace damping matrix [Nms/rad]
+      RUT::Vector6d stiction{};                              // Static friction compensation [N, Nm]
     };
     ComplianceParameters6d compliance6d{};
   };
 
+  // ========== Constructor/Destructor ==========
+  
   ImpedanceController();
   ~ImpedanceController();
   ImpedanceController(ImpedanceController&&);
 
+  // ========== Initialization ==========
+
   /**
-   * @brief      initialize the controller.
-   *
-   * @param[in]  time0         The time point to start ticking from.
-   * @param[in]  config        The struct contains all configs.
-   * @param[in]  pose_current  The current robot pose (tool frame)
-   *
-   * @return     True if successfully initialized.
+   * Initialize the impedance controller
+   * 
+   * @param time0         Start time reference point for controller timing
+   * @param config        Configuration structure containing all controller parameters
+   * @param pose_current  Current robot pose (tool frame) [x, y, z, qw, qx, qy, qz] (mm, quaternion)
+   * @return true if initialization successful, false otherwise
    */
   bool init(const RUT::TimePoint& time0,
             const ImpedanceControllerConfig& config,
             const RUT::Vector7d& pose_current);
 
+  // ========== Robot State Management ==========
+
   /**
-   * @brief      Sets the robot status.
-   *
-   * @param[in]  pose_WT    The current tool frame pose in the world frame.
-   * @param[in]  wrench_WT  The tool wrench feedback.
+   * Update robot status with current measurements
+   * 
+   * @param pose_WT    Current tool frame pose in world frame [x, y, z, qw, qx, qy, qz] (mm, quaternion)
+   * @param wrench_T   Tool wrench feedback in tool frame [fx, fy, fz, mx, my, mz] (N, Nm)
    */
   void setRobotStatus(const RUT::Vector7d& pose_WT,
                       const RUT::Vector6d& wrench_T);
+
   /**
-   * @brief      Set the position and force reference (user command).
-   *
-   * @param[in] pose_WT     tool pose represented in the world frame.
-   * @param[in] wrench_WTr  wrench measured in the transformed frame.
-   *
-   * WARNING remember to call step() after setRobotReference, before
-   * setForceControlledAxis. step() will properly update internal states, which
-   * is required for setForceControlledAxis to work properly.
+   * Set position and force reference commands
+   * 
+   * @param pose_WT     Target tool pose in world frame [x, y, z, qw, qx, qy, qz] (mm, quaternion)
+   * @param wrench_WTr  Target wrench in transformed frame [fx, fy, fz, mx, my, mz] (N, Nm)
+   * 
+   * @warning Always call step() after setRobotReference() and before setForceControlledAxis().
+   *          step() updates internal states required for setForceControlledAxis() to work properly.
    */
   void setRobotReference(const RUT::Vector7d& pose_WT,
                          const RUT::Vector6d& wrench_WTr);
+
+  // ========== Control Mode Configuration ==========
+
   /**
-   * @brief      Sets the force controlled axis.
-   *
-   * @param[in]  Tr    6x6 orthonormal matrix. Describes the axis direction.
-   * @param[in]  n_af  The number of force controlled axes.
+   * Configure which axes are force-controlled vs position-controlled
+   * 
+   * @param Tr    6x6 orthonormal transformation matrix defining axis directions
+   * @param n_af  Number of force-controlled axes (0-6, remaining axes are position-controlled)
    */
   void setForceControlledAxis(const RUT::Matrix6d& Tr, int n_af);
 
+  // ========== Impedance Parameter Configuration ==========
+
   /**
-   * @brief      Sets the stiffness matrix.
-   *
-   * @param[in]  stiffness  The stiffness matrix.
+   * Set Cartesian stiffness matrix
+   * 
+   * @param stiffness  6x6 Cartesian stiffness matrix [N/m for translation, Nm/rad for rotation]
    */
   void setStiffnessMatrix(const RUT::Matrix6d& stiffness);
 
   /**
-   * @brief      Sets the damping matrix.
-   *
-   * @param[in]  damping  The damping matrix.
+   * Set Cartesian damping matrix
+   * 
+   * @param damping  6x6 Cartesian damping matrix [Ns/m for translation, Nms/rad for rotation]
    */
   void setDampingMatrix(const RUT::Matrix6d& damping);
 
   /**
-   * @brief      Sets the stiffness matrix.
-   *
-   * @param[in]  stiffness  The stiffness matrix.
+   * Set joint nullspace stiffness matrix
+   * 
+   * @param stiffness  7x7 joint stiffness matrix for nullspace behavior [Nm/rad]
    */
   void setNullspaceStiffnessMatrix(const RUT::MatrixXd& stiffness);
 
   /**
-   * @brief      Sets the damping matrix.
-   *
-   * @param[in]  damping  The damping matrix.
+   * Set joint nullspace damping matrix
+   * 
+   * @param damping  7x7 joint damping matrix for nullspace behavior [Nms/rad]
    */
   void setNullspaceDampingMatrix(const RUT::MatrixXd& damping);
 
+  // ========== Control Execution ==========
+
   /**
-   * @brief return true if no error.
+   * Execute one control step and compute output pose
+   * 
+   * @param pose  Output target pose [x, y, z, qw, qx, qy, qz] (mm, quaternion)
+   * @return 0 if successful, error code otherwise
    */
   int step(RUT::Vector7d& pose);
 
+  // ========== State Management ==========
+
   /**
-   * @brief      Reset all internal states to default. It is recommended to call
-   * reset() everytime the robot starts from a complete stop in the air. This
-   * includes setting all position offsets/force errors to zero. Call reset()
-   * when the next action is computed based on the robot's current pose instead
-   *  of being part of a pre-planned trajectory. After a reset(), call
-   * setRobotReference() immediately.
+   * Reset all internal states to default values
+   * 
+   * Recommended to call when robot starts from complete stop or when switching
+   * from trajectory following to reactive control. Resets position offsets and
+   * force errors to zero. Call setRobotReference() immediately after reset().
    */
   void reset();
 
+  // ========== Debugging and Monitoring ==========
+
   /**
-   * @brief      Print the current states to the console.
+   * Display current controller states to console
+   * Useful for debugging and monitoring controller performance
    */
   void displayStates();
 
+  // ========== Robot Interface ==========
+
   /**
-   * @brief      Get robot Jacobian
+   * Update robot Jacobian matrix
+   * 
+   * @param jacob  6x7 robot Jacobian matrix relating joint velocities to end-effector velocity
    */
   void getJacobian(const Eigen::Matrix<double, 6, 7>& jacob);
 
   /**
-   * @brief      Get robot state (franka::RobotState)
+   * Update robot state information
+   * 
+   * @param state  Current Franka robot state containing joint positions, velocities, torques, etc.
    */
   void getRobotState(franka::RobotState& state);
 
  private:
+  // Pimpl idiom: Private implementation pointer
   struct Implementation;
   std::unique_ptr<Implementation> m_impl;
 };
 
-#endif  // _IMPEDANCE_CONROLLER_H_
+#endif  // _IMPEDANCE_CONTROLLER_H_
