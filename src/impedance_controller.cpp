@@ -1,10 +1,17 @@
 /**
  * IMPEDANCE CONTROLLER
- * 
- * This file is part of the package:
- * https://github.com/mikelasa/force_control_impedance
  *
- * Reference: Matthias Mayr, Julian M. Salt-Ducaju, "A C++ Implementation of a Cartesian Impedance Controller for Robotic Manipulators"
+ * Purpose:
+ *   Cartesian impedance controller implementation for robotic manipulators.
+ *   Computes joint torques from pose error, velocity feedback, and optional
+ *   nullspace regulation to achieve compliant behavior in task space.
+ *
+ * This file is part of the package:
+ *   https://github.com/mikelasa/force_control_impedance
+ *
+ * Reference:
+ *   Matthias Mayr, Julian M. Salt-Ducaju,
+ *   "A C++ Implementation of a Cartesian Impedance Controller for Robotic Manipulators"
  *
  */
 
@@ -43,7 +50,12 @@ static const Eigen::IOFormat MatlabFmt(Eigen::StreamPrecision, 0, ", ", ";\n", "
 
 /**
  * Private implementation structure for ImpedanceController
- * Contains all internal state variables and control logic
+ * Contains all internal state variables and control logic.
+ *
+ * Thread Safety:
+ *   This class is not internally synchronized; callers must ensure
+ *   thread-safe access (typically through controller mutex in the
+ *   host application).
  */
 struct ImpedanceController::Implementation {
     // ========== Constructor/Destructor ==========
@@ -141,15 +153,23 @@ ImpedanceController::Implementation::~Implementation() {
 bool ImpedanceController::Implementation::initialize(
     const RUT::TimePoint& time_initial_0,
     const ImpedanceControllerConfig& impedance_controller_config) {
-    
+
     std::cout << "[ImpedanceController] Begin initialization.\n";
+
+    // ========================================================================
+    // Step 1: Load configuration and start synchronized timer
+    // ========================================================================
     config = impedance_controller_config;
     timer.tic(time_initial_0);
 
-    // Reset all internal states to default values
+    // ========================================================================
+    // Step 2: Reset all internal states to default values
+    // ========================================================================
     reset();
 
-    // Initialize data logging if enabled
+    // ========================================================================
+    // Step 3: Initialize data logging (optional)
+    // ========================================================================
     if (config.log_to_file) {
         log_file.open(config.log_file_path);
         if (log_file.is_open())
@@ -166,15 +186,18 @@ bool ImpedanceController::Implementation::initialize(
 
 void ImpedanceController::Implementation::setRobotStatus(
     const RUT::Vector7d& pose_WT, const RUT::Vector6d& wrench_WT) {
-    
-    // Gets feedback from robot
-    pose_fb = pose_WT;
-    wrench_T_fb = -wrench_WT;  // Note: Sign convention inversion
 
-    // Split pose into position and quaternions
+    // ========================================================================
+    // Feedback acquisition (pose + wrench)
+    // ========================================================================
+    // Note: wrench is negated to match internal sign convention
+    pose_fb = pose_WT;
+    wrench_T_fb = -wrench_WT;
+
+    // Split pose into translation and quaternion
     pose_fb_trans = pose_fb.head(3);
-    
-    // TODO: CONVENCIONES! (conventions)
+
+    // TODO: Confirm quaternion conventions (w, x, y, z)
     Eigen::Quaterniond q;
     q.w() = pose_fb[3]; // index 3 = w
     q.x() = pose_fb[4]; // index 4 = x
@@ -185,12 +208,14 @@ void ImpedanceController::Implementation::setRobotStatus(
 
 void ImpedanceController::Implementation::setRobotReference(
     const RUT::Vector7d& pose_WT, const RUT::Vector6d& wrench_WTr) {
-    
-    // Gets reference command
+
+    // ========================================================================
+    // Reference command update (pose + wrench)
+    // ========================================================================
     pose_ref = pose_WT;
     wrench_ref = wrench_WTr;
 
-    // Split pose into position and quaternions
+    // Split pose into translation and quaternion
     pose_ref_trans = pose_ref.head(3);
     Eigen::Quaterniond q;
     q.w() = pose_ref[3]; // index 3 = w
@@ -266,51 +291,59 @@ int ImpedanceController::Implementation::step(RUT::Vector7d& torque_to_send) {
     profiler.clear();
     profiler.start();
     timer.tic();
-    
-    // ========== Position Error Computation ==========
-    // Compute pose translation error
+
+    // ========================================================================
+    // Phase 1: Compute pose error (translation + orientation)
+    // ========================================================================
+    // Translation error
     pose_error.head(3) << pose_fb_trans - pose_ref_trans;
-    
-    // Check for quaternion discontinuity (ensure shortest rotation path)
+
+    // Quaternion discontinuity check (ensure shortest rotation)
     if (pose_ref_rot.dot(pose_fb_rot) < 0.0) {
         pose_fb_rot.coeffs() *= -1.0; // Flip sign in-place
     }
 
-    // Quaternion error: current * inverse(desired)
+    // Orientation error: current * inverse(desired)
     const Eigen::Quaterniond error_quaternion(pose_fb_rot * pose_ref_rot.inverse());
     Eigen::AngleAxisd angle_axis(error_quaternion);
     pose_error.tail(3) << angle_axis.axis() * angle_axis.angle();
-    // For plot purposes
-   
+
     profiler.stop("1");
     profiler.start();
 
-    // ========== Torque Computation ==========
-    
-    // Compute task torques (impedance model)
+    // ========================================================================
+    // Phase 2: Compute control torques
+    // ========================================================================
+    // Task-space impedance torque
     // tau_task = J^T * (-K_x * x_error - D_x * x_dot)
-    tau_task << jacobian.transpose() * (-config.compliance6d.stiffness * pose_error - config.compliance6d.damping * (jacobian * joint_vel));
-    
-    // Compute nullspace torques (joint space regulation)
+    tau_task << jacobian.transpose() *
+        (-config.compliance6d.stiffness * pose_error -
+         config.compliance6d.damping * (jacobian * joint_vel));
+
+    // Nullspace torque (joint space regulation)
     // N = I - J^T * (J^T)^+
-    null_jacobian = MatrixXd::Identity(7, 7) - jacobian.transpose() * jacobian_pseud_inv.transpose();
+    null_jacobian = MatrixXd::Identity(7, 7) -
+        jacobian.transpose() * jacobian_pseud_inv.transpose();
 
-    // Print debug (comment for now)
-    tau_nullspace << null_jacobian * (- config.compliance6d.nullspace_stiffness * (joint_pos - joint_pos_null_desired) - config.compliance6d.nullspace_damping * joint_vel);
-    
-    // Compute external torques (from external forces)
-    tau_ext << jacobian.transpose() * wrench_T_fb;
+    tau_nullspace << null_jacobian *
+        (-config.compliance6d.nullspace_stiffness *
+             (joint_pos - joint_pos_null_desired) -
+         config.compliance6d.nullspace_damping * joint_vel);
 
-    // Compute all torques (note: tau_ext is commented out)
-    tau_d << tau_task  + tau_nullspace;// + tau_ext;
+    // External torque (if enabled by user, currently not applied)
+    tau_ext << jacobian.transpose() * wrench_ref;
+
+    // Total desired torque
+    tau_d << tau_task + tau_nullspace; // + tau_ext;
 
     profiler.stop("2");
     profiler.start();
 
-    // Set output torque command
+    // ========================================================================
+    // Phase 3: Output command and run safety checks
+    // ========================================================================
     torque_to_send = tau_d;
 
-    // ========== Safety Checks ==========
     if (std::isnan(torque_to_send[0])) {
         std::cerr << "==================== pose is nan. =====================\n";
         displayStates();
@@ -318,18 +351,19 @@ int ImpedanceController::Implementation::step(RUT::Vector7d& torque_to_send) {
         getchar();
         return false;
     }
-    
+
     profiler.stop("4");
     profiler.start();
-    
-    // ========== Data Logging ==========
+
+    // ========================================================================
+    // Phase 4: Optional logging and performance monitoring
+    // ========================================================================
     if (config.log_to_file) {
         logStates();
     }
-    
+
     profiler.stop("5");
-    
-    // ========== Performance Monitoring ==========
+
     double timenow = timer.toc_ms();
     if (config.alert_overrun && timenow > config.dt * 1000.) {
         std::cerr << "impedanceController: step took too long: " << timenow << "ms"
@@ -344,10 +378,12 @@ int ImpedanceController::Implementation::step(RUT::Vector7d& torque_to_send) {
 // ========== State Management Implementation ==========
 
 void ImpedanceController::Implementation::reset() {
-    // Reset transformation matrix to identity
+    // ========================================================================
+    // Reset all internal states to safe defaults
+    // ========================================================================
     Tr = Matrix6d::Identity();
-    
-    // Reset pose states
+
+    // Pose states
     pose_fb = RUT::Vector7d::Zero();
     pose_fb_trans = Vector3d::Zero();
     pose_fb_rot = Quaterniond::Identity();
@@ -355,18 +391,18 @@ void ImpedanceController::Implementation::reset() {
     pose_ref_trans = Vector3d::Zero();
     pose_ref_rot = Quaterniond::Identity();
     pose_error = RUT::Vector6d::Zero();
-    
-    // Reset Jacobian matrices
+
+    // Jacobians
     jacobian = MatrixXd::Zero(6, 7);
     jacobian_pseud_inv = MatrixXd::Zero(7, 6);
-    
-    // Reset torque states
+
+    // Torques
     tau_task = RUT::Vector7d::Zero();
     tau_nullspace = RUT::Vector7d::Zero();
     tau_ext = RUT::Vector7d::Zero();
     tau_d = RUT::Vector7d::Zero();
-    
-    // Reset orientation error
+
+    // Orientation error
     error_quaternion = Quaterniond::Identity();
 }
 
@@ -410,23 +446,29 @@ void ImpedanceController::Implementation::displayStates() {
 
 // ========== Robot Interface Implementation ==========
 
-void ImpedanceController::Implementation::getJacobian(const Eigen::Matrix<double, 6, 7>& jacob) {
-    // Get the jacobian
+void ImpedanceController::Implementation::getJacobian(
+    const Eigen::Matrix<double, 6, 7>& jacob) {
+    // ========================================================================
+    // Update Jacobian and compute pseudoinverse
+    // ========================================================================
     jacobian = jacob;
 
-    // Compute the pseudoinverse of the jacobian using complete orthogonal decomposition
-    jacobian_pseud_inv = jacob.completeOrthogonalDecomposition().solve(Eigen::MatrixXd::Identity(6, 6));
+    // Complete orthogonal decomposition provides a numerically stable pseudo-inverse
+    jacobian_pseud_inv =
+        jacob.completeOrthogonalDecomposition().solve(Eigen::MatrixXd::Identity(6, 6));
 }
 
 void ImpedanceController::Implementation::getRobotState(franka::RobotState& state) {
-    // Extract each element and save into internal variables
+    // ========================================================================
+    // Extract relevant robot state fields
+    // ========================================================================
     joint_pos = Eigen::Map<const Eigen::VectorXd>(state.q.data(), 7);
     joint_vel = Eigen::Map<const Eigen::VectorXd>(state.dq.data(), 7);
     end_effector_pose = Eigen::Matrix4d::Map(state.O_T_EE.data());
     external_wrench = Eigen::Map<const Eigen::VectorXd>(state.O_F_ext_hat_K.data(), 6);
     // ... add other elements as needed
-    
-    // Initialize joint_pos_null_desired only once, keeping the initial position as the desired nullspace position
+
+    // Initialize desired nullspace posture only once (first read)
     static bool nullspace_initialized = false;
     if (!nullspace_initialized) {
         joint_pos_null_desired = joint_pos;
