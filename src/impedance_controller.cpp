@@ -21,6 +21,7 @@
 #include <franka/robot_state.h>
 
 #include <Eigen/QR>
+#include <array>
 #include <cmath>
 #include <iostream>
 #include <string>
@@ -87,6 +88,7 @@ struct ImpedanceController::Implementation {
 
     // ========== Debugging and Monitoring ==========
     void logStates();
+    void flushLog();
     void displayStates();
 
     // ========== Robot Interface ==========
@@ -137,6 +139,13 @@ struct ImpedanceController::Implementation {
     RUT::Timer timer{};                     // Timing utility
     RUT::Profiler profiler{};               // Performance profiling utility
     std::ofstream log_file{};               // Data logging file stream
+
+    // Log buffer — pre-allocated to avoid RT-loop allocations
+    struct LogEntry {
+        double timestamp_ms;
+        std::array<double, 6> wrench;
+    };
+    std::vector<LogEntry> log_buffer{};
 };
 
 // ========== Implementation Constructor/Destructor ==========
@@ -144,8 +153,22 @@ struct ImpedanceController::Implementation {
 ImpedanceController::Implementation::Implementation() {}
 
 ImpedanceController::Implementation::~Implementation() {
-    if (config.log_to_file)
-        log_file.close();
+    flushLog();
+}
+
+void ImpedanceController::Implementation::flushLog() {
+    if (!config.log_to_file || !log_file.is_open() || log_buffer.empty()) return;
+    const size_t n = log_buffer.size();
+    for (const auto& entry : log_buffer) {
+        log_file << entry.timestamp_ms;
+        for (double v : entry.wrench)
+            log_file << " " << v;
+        log_file << "\n";
+    }
+    log_file.flush();
+    log_file.close();
+    log_buffer.clear();
+    std::cout << "[ImpedanceController] log flushed (" << n << " samples)" << std::endl;
 }
 
 // ========== Implementation Initialization ==========
@@ -172,12 +195,15 @@ bool ImpedanceController::Implementation::initialize(
     // ========================================================================
     if (config.log_to_file) {
         log_file.open(config.log_file_path);
-        if (log_file.is_open())
+        if (log_file.is_open()) {
+            log_buffer.reserve(config.log_max_samples);
             std::cout << "[ImpedanceController] log file opened successfully at "
-                      << config.log_file_path << std::endl;
-        else
+                      << config.log_file_path << " (buffer: "
+                      << config.log_max_samples << " samples)" << std::endl;
+        } else {
             std::cerr << "[ImpedanceController] Failed to open log file at "
                       << config.log_file_path << std::endl;
+        }
     }
     return true;
 }
@@ -409,17 +435,11 @@ void ImpedanceController::Implementation::reset() {
 // ========== Debugging and Monitoring Implementation ==========
 
 void ImpedanceController::Implementation::logStates() {
-    log_file << timer.toc_ms() << " ";
-    stream_vector7(log_file, pose_fb);
-    stream_vector7(log_file, pose_ref);
-    stream_vector7(log_file, joint_pos);
-    stream_vector7(log_file, joint_vel);
-    RUT::stream_array_in6d(log_file, wrench_T_fb);
-    stream_vector7(log_file, tau_task);
-    stream_vector7(log_file, tau_nullspace);
-    stream_vector7(log_file, tau_ext);
-    stream_vector7(log_file, tau_d);
-    log_file << std::endl;
+    if (log_buffer.size() >= log_buffer.capacity()) return;
+    LogEntry& entry = log_buffer.emplace_back();
+    entry.timestamp_ms = timer.toc_ms();
+    for (int i = 0; i < 6; ++i)
+        entry.wrench[i] = wrench_T_fb[i];
 }
 
 void ImpedanceController::Implementation::displayStates() {
@@ -540,6 +560,10 @@ void ImpedanceController::setNullspaceDampingMatrix(const MatrixXd& damping) {
 
 int ImpedanceController::step(RUT::Vector7d& pose_to_send) {
     return m_impl->step(pose_to_send);
+}
+
+void ImpedanceController::flushLog() {
+    m_impl->flushLog();
 }
 
 void ImpedanceController::displayStates() {

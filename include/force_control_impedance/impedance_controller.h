@@ -31,6 +31,7 @@ class ImpedanceController {
     double dt{0.001};                                        // Integration/differentiation time step (s)
     bool log_to_file{false};                                 // Enable data logging to file
     std::string log_file_path{""};                           // Path for log file output
+    int log_max_samples{600000};                             // Pre-allocated log buffer size (600000 = 10 min at 1kHz)
     bool alert_overrun{false};                               // Print warning when step() exceeds time limit
 
     /**
@@ -152,6 +153,13 @@ class ImpedanceController {
   void reset();
 
   // ========== Debugging and Monitoring ==========
+
+  /**
+   * Flush the in-memory log buffer to disk immediately.
+   * Call this before the program exits (e.g. on Ctrl+C) to ensure data is saved.
+   * Safe to call multiple times; subsequent calls after the first are no-ops.
+   */
+  void flushLog();
 
   /**
    * Display current controller states to console
